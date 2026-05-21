@@ -90,9 +90,25 @@ class Sam2FrameMasker:
         self.detect_orange_points = segment_gripper.detect_orange_points
         self.predictor, self.device = segment_gripper.build_predictor(model_key)
         self.lock = threading.Lock()
+        self.prev_frame = None
+        self.prev_mask = None
+        self.reject_count = 0
+
+    def reset(self):
+        self.prev_frame = None
+        self.prev_mask = None
+        self.reject_count = 0
 
     def predict(self, frame):
         frame = np.asarray(frame).astype(np.uint8)
+        if self.prev_frame is not None and self.prev_mask is not None:
+            return self._predict_two_frame(frame)
+
+        mask = self._predict_single_frame(frame)
+        self._accept(frame, mask)
+        return mask
+
+    def _predict_single_frame(self, frame):
         point_coords, point_labels = self.detect_orange_points(frame)
 
         with tempfile.TemporaryDirectory(prefix='viewforce_tts_sam2_') as frame_dir:
@@ -120,6 +136,91 @@ class Sam2FrameMasker:
                     return mask.astype(np.uint8) * 255
 
         return np.zeros(frame.shape[:2], dtype=np.uint8)
+
+    def _predict_two_frame(self, frame):
+        prev_frame = self.prev_frame
+        prev_mask = self.prev_mask
+        if prev_frame.shape[:2] != frame.shape[:2]:
+            prev_mask = cv.resize(
+                prev_mask,
+                (frame.shape[1], frame.shape[0]),
+                interpolation=cv.INTER_NEAREST,
+            )
+            prev_frame = cv.resize(prev_frame, (frame.shape[1], frame.shape[0]))
+
+        with tempfile.TemporaryDirectory(prefix='viewforce_tts_sam2_pair_') as frame_dir:
+            frame_dir = Path(frame_dir)
+            Image.fromarray(prev_frame).save(str(frame_dir / '000000.jpg'), quality=95)
+            Image.fromarray(frame).save(str(frame_dir / '000001.jpg'), quality=95)
+            autocast = (
+                torch.autocast(self.device, dtype=torch.bfloat16)
+                if self.device == 'cuda'
+                else contextlib.nullcontext()
+            )
+            with self.lock, torch.inference_mode(), autocast:
+                state = self.predictor.init_state(video_path=str(frame_dir))
+                self.predictor.reset_state(state)
+                self.predictor.add_new_mask(
+                    inference_state=state,
+                    frame_idx=0,
+                    obj_id=1,
+                    mask=prev_mask.astype(bool),
+                )
+                candidate = None
+                for out_idx, _obj_ids, out_logits in self.predictor.propagate_in_video(
+                    state,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=2,
+                ):
+                    if out_idx == 1:
+                        candidate = (out_logits[0] > 0.0).cpu().numpy().squeeze()
+                        break
+
+        if candidate is None:
+            candidate_mask = prev_mask
+        else:
+            candidate_mask = candidate.astype(np.uint8) * 255
+
+        if self._is_sane(candidate_mask, prev_mask):
+            self._accept(frame, candidate_mask)
+            return candidate_mask
+
+        self.reject_count += 1
+        print(
+            'TTS SAM2 rejected propagated mask; '
+            f'using previous mask (reject_count={self.reject_count})'
+        )
+        return prev_mask
+
+    def _accept(self, frame, mask):
+        self.prev_frame = frame.copy()
+        self.prev_mask = np.asarray(mask).astype(np.uint8).copy()
+        self.reject_count = 0
+
+    def _is_sane(self, mask, prev_mask):
+        mask_bool = np.asarray(mask).astype(bool)
+        prev_bool = np.asarray(prev_mask).astype(bool)
+        area = int(mask_bool.sum())
+        prev_area = int(prev_bool.sum())
+        total = mask_bool.size
+        if area == 0:
+            return False
+        if area / float(total) > 0.40:
+            return False
+        if prev_area > 0 and area / float(prev_area) > 2.5:
+            return False
+        if prev_area > 0 and area / float(prev_area) < 0.25:
+            return False
+
+        ys, xs = np.where(mask_bool)
+        if len(xs) == 0:
+            return False
+        width = xs.max() - xs.min() + 1
+        height = ys.max() - ys.min() + 1
+        img_h, img_w = mask_bool.shape
+        if width > 0.95 * img_w and height > 0.95 * img_h:
+            return False
+        return True
 
 
 class DiffusionPolicy:
@@ -177,6 +278,8 @@ class DiffusionPolicy:
 
     def reset(self):
         self.flush_tts_rollout()
+        if self.tts_masker is not None and hasattr(self.tts_masker, 'reset'):
+            self.tts_masker.reset()
         self.policy.reset()
 
     def step(self, obs_sequence):
