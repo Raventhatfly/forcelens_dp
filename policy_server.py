@@ -10,6 +10,7 @@ On the robot-controller side, use RemotePolicy with:
 
 import argparse
 import atexit
+import csv
 import contextlib
 import math
 import queue
@@ -41,6 +42,7 @@ LATENCY_STEPS = math.ceil(LATENCY_BUDGET / CONTROL_PERIOD)  # 2
 
 IMAGE_H = 240
 IMAGE_W = 320
+VIEWFORCE_INPUT_SIZE = (256, 256)
 
 # Same gripper-colour prior used by ViewForce's offline mask bootstrapping.
 GRIPPER_H_MIN = 130.0
@@ -234,6 +236,10 @@ class DiffusionPolicy:
         tts_auto_mask=False,
         tts_masker=None,
         tts_mask_mode='sam2',
+        tts_steering_mode='scale',
+        tts_sampling_candidates=1,
+        tts_sampling_score_steps=4,
+        tts_action_force_gain=1.0,
         tts_rollout_dir=None,
         tts_rollout_fps=10.0,
         tts_mask_h_min=GRIPPER_H_MIN,
@@ -265,6 +271,10 @@ class DiffusionPolicy:
         self.tts_auto_mask = tts_auto_mask
         self.tts_masker = tts_masker
         self.tts_mask_mode = tts_mask_mode
+        self.tts_steering_mode = tts_steering_mode
+        self.tts_sampling_candidates = max(1, int(tts_sampling_candidates))
+        self.tts_sampling_score_steps = max(1, int(tts_sampling_score_steps))
+        self.tts_action_force_gain = float(tts_action_force_gain)
         self.tts_rollout_dir = Path(tts_rollout_dir) if tts_rollout_dir else None
         self.tts_rollout_fps = tts_rollout_fps
         self.tts_rollout = None
@@ -290,14 +300,23 @@ class DiffusionPolicy:
                 print('Warming up...')
                 self.policy.predict_action(obs_dict)
                 self.warmed_up = True
-            result = self.policy.predict_action(obs_dict)
-        # (1, horizon, 8) -> (horizon, 8)
-        actions = result['action'][0].cpu().numpy()
         if self.steering_pipeline is not None:
-            actions = self._steer_actions(obs_sequence[-1], actions)
+            if self.tts_steering_mode == 'sample':
+                actions = self._sample_steer_actions(obs_sequence[-1], obs_dict)
+            else:
+                with torch.no_grad():
+                    result = self.policy.predict_action(obs_dict)
+                # (1, horizon, 8) -> (horizon, 8)
+                actions = result['action'][0].cpu().numpy()
+                actions = self._steer_actions(obs_sequence[-1], actions)
+        else:
+            with torch.no_grad():
+                result = self.policy.predict_action(obs_dict)
+            # (1, horizon, 8) -> (horizon, 8)
+            actions = result['action'][0].cpu().numpy()
         return self._split_action(actions)
 
-    def _steer_actions(self, latest_obs, actions):
+    def _get_tts_frame_mask(self, latest_obs):
         frame_key = self.tts_frame_key
         if frame_key is None:
             image_keys = [
@@ -331,18 +350,34 @@ class DiffusionPolicy:
                 f'TTS mask key {self.tts_mask_key!r} not found in obs. '
                 f'Available obs keys: {sorted(latest_obs.keys())}'
             )
+        return frame, mask
 
+    def _get_tts_stats(self, frame, mask):
         mask_area = int(np.asarray(mask).astype(bool).sum())
         mask_frac = mask_area / float(mask.shape[0] * mask.shape[1])
         frame_mean = float(np.asarray(frame).mean())
         hsv = cv.cvtColor(frame, cv.COLOR_RGB2HSV).astype(np.float32)
         sat_mean = float((hsv[:, :, 1] / 255.0).mean())
         val_mean = float((hsv[:, :, 2] / 255.0).mean())
-        self._record_tts_rollout_frame(frame, mask)
+        return mask_area, mask_frac, frame_mean, sat_mean, val_mean
+
+    def _steer_actions(self, latest_obs, actions):
+        frame, mask = self._get_tts_frame_mask(latest_obs)
+        mask_area, mask_frac, frame_mean, sat_mean, val_mean = self._get_tts_stats(frame, mask)
+        rollout_frame_idx = self._record_tts_rollout_frame(frame, mask)
         result = self.steering_pipeline.steer_action_chunk(
             frame,
             mask,
             actions,
+        )
+        self._record_tts_force_row(
+            rollout_frame_idx,
+            result,
+            mask_area=mask_area,
+            mask_frac=mask_frac,
+            frame_mean=frame_mean,
+            sat_mean=sat_mean,
+            val_mean=val_mean,
         )
         print(
             'TTS force '
@@ -359,6 +394,104 @@ class DiffusionPolicy:
             f'val_mean={val_mean:.3f}'
         )
         return result.action
+
+    def _sample_steer_actions(self, latest_obs, obs_dict):
+        frame, mask = self._get_tts_frame_mask(latest_obs)
+        mask_area, mask_frac, frame_mean, sat_mean, val_mean = self._get_tts_stats(frame, mask)
+        rollout_frame_idx = self._record_tts_rollout_frame(frame, mask)
+
+        pred = self.steering_pipeline.estimator.predict(
+            frame,
+            mask,
+            force_key=self.steering_pipeline.config.force_key,
+            force_mode=self.steering_pipeline.config.force_mode,
+        )
+        cfg = self.steering_pipeline.config
+
+        with torch.no_grad():
+            batched_obs = dict_apply(
+                obs_dict,
+                lambda x: x.repeat_interleave(self.tts_sampling_candidates, dim=0),
+            )
+            result = self.policy.predict_action(batched_obs)
+            candidates = result['action'].detach().cpu().numpy()
+
+        scores = []
+        proxy_forces = []
+        steps = min(self.tts_sampling_score_steps, candidates.shape[1])
+        closing_sign = 1.0 if cfg.close_positive else -1.0
+        gi = cfg.gripper_index
+        for action in candidates:
+            if gi is None:
+                closing_mean = 0.0
+            else:
+                close_signal = closing_sign * action[:steps, gi]
+                closing_mean = float(np.maximum(close_signal, 0.0).mean())
+            proxy_force = float(pred.control_force + self.tts_action_force_gain * closing_mean)
+            score = float((proxy_force - cfg.desired_force) ** 2)
+            scores.append(score)
+            proxy_forces.append(proxy_force)
+
+        best_idx = int(np.argmin(scores))
+        selected = candidates[best_idx]
+
+        metadata = {
+            'desired_force': cfg.desired_force,
+            'deadband': cfg.deadband,
+            'over_target': max(0.0, pred.control_force - cfg.desired_force - cfg.deadband),
+            'under_target': max(0.0, cfg.desired_force - pred.control_force - cfg.deadband),
+            'stopped_or_opened': False,
+            'gripper_index': cfg.gripper_index,
+            'motion_indices': list(cfg.motion_indices),
+            'sampling_mode': 'sample',
+            'sampling_candidates': self.tts_sampling_candidates,
+            'sampling_best_idx': best_idx,
+            'sampling_best_score': scores[best_idx],
+            'sampling_best_proxy_force': proxy_forces[best_idx],
+            'sampling_score_steps': steps,
+            'sampling_action_force_gain': self.tts_action_force_gain,
+        }
+        sample_result = self._make_sample_result(
+            selected,
+            pred,
+            force_error=float(cfg.desired_force - pred.control_force),
+            metadata=metadata,
+        )
+        self._record_tts_force_row(
+            rollout_frame_idx,
+            sample_result,
+            mask_area=mask_area,
+            mask_frac=mask_frac,
+            frame_mean=frame_mean,
+            sat_mean=sat_mean,
+            val_mean=val_mean,
+        )
+
+        print(
+            'TTS sample '
+            f'{pred.selected_key}={pred.selected_force:.3f}, '
+            f'control={pred.control_force:.3f}, '
+            f'best={best_idx}/{self.tts_sampling_candidates}, '
+            f'proxy={proxy_forces[best_idx]:.3f}, '
+            f'score={scores[best_idx]:.4f}, '
+            f'mask_px={mask_area}, '
+            f'mask_frac={mask_frac:.4f}'
+        )
+        return selected
+
+    def _make_sample_result(self, action, predicted_force, force_error, metadata):
+        class Result:
+            pass
+
+        result = Result()
+        result.action = np.asarray(action, dtype=np.float32)
+        result.base_action = np.asarray(action, dtype=np.float32)
+        result.predicted_force = predicted_force
+        result.force_error = float(force_error)
+        result.close_scale = 1.0
+        result.motion_scale = 1.0
+        result.metadata = metadata
+        return result
 
     def _make_gripper_mask(self, frame):
         if self.tts_mask_mode == 'sam2':
@@ -437,6 +570,7 @@ class DiffusionPolicy:
                 + 0.5 * np.array([255, 50, 50], dtype=np.float32)
             ).astype(np.uint8)
             mask_rgb = np.repeat(mask_bool[:, :, None].astype(np.uint8) * 255, 3, axis=2)
+            model_input = self._make_viewforce_input_preview(frame, mask_bool)
 
             self.tts_rollout['overlay'].write(cv.cvtColor(overlay, cv.COLOR_RGB2BGR))
             self.tts_rollout['mask'].write(cv.cvtColor(mask_rgb, cv.COLOR_RGB2BGR))
@@ -449,7 +583,97 @@ class DiffusionPolicy:
                 str(self.tts_rollout['frames_dir'] / f'mask_{frame_idx:06d}.png'),
                 cv.cvtColor(mask_rgb, cv.COLOR_RGB2BGR),
             )
+            cv.imwrite(
+                str(self.tts_rollout['frames_dir'] / f'model_input_{frame_idx:06d}.png'),
+                cv.cvtColor(model_input, cv.COLOR_RGB2BGR),
+            )
             self.tts_rollout_frames += 1
+            return frame_idx
+
+    def _make_viewforce_input_preview(self, frame, mask_bool):
+        masked = frame.astype(np.float32) * mask_bool[:, :, None]
+        masked_u8 = np.clip(masked, 0, 255).astype(np.uint8)
+        return np.asarray(
+            Image.fromarray(masked_u8).resize(
+                (VIEWFORCE_INPUT_SIZE[1], VIEWFORCE_INPUT_SIZE[0]),
+                Image.BILINEAR,
+            )
+        )
+
+    def _record_tts_force_row(
+        self,
+        frame_idx,
+        result,
+        mask_area,
+        mask_frac,
+        frame_mean,
+        sat_mean,
+        val_mean,
+    ):
+        if self.tts_rollout_dir is None or frame_idx is None:
+            return
+
+        with self.tts_rollout_lock:
+            if self.tts_rollout is None:
+                return
+
+            out_dir = self.tts_rollout['dir']
+            csv_path = out_dir / 'force_log.csv'
+            pred = result.predicted_force
+            metadata = result.metadata
+            gripper_index = metadata.get('gripper_index')
+
+            base_gripper = ''
+            action_gripper = ''
+            if gripper_index is not None:
+                base = np.asarray(result.base_action)
+                action = np.asarray(result.action)
+                if base.ndim == 2 and -base.shape[1] <= gripper_index < base.shape[1]:
+                    base_gripper = float(base[0, gripper_index])
+                if action.ndim == 2 and -action.shape[1] <= gripper_index < action.shape[1]:
+                    action_gripper = float(action[0, gripper_index])
+
+            force_values = ';'.join(
+                f'{key}={value:.6f}' for key, value in pred.values.items()
+            )
+            row = {
+                'frame_idx': frame_idx,
+                'time_s': frame_idx / float(self.tts_rollout_fps),
+                'force_key': pred.selected_key,
+                'selected_force_n': pred.selected_force,
+                'control_force_n': pred.control_force,
+                'force_mode': pred.force_mode,
+                'force_values': force_values,
+                'desired_force_n': metadata.get('desired_force', ''),
+                'force_error_n': result.force_error,
+                'close_scale': result.close_scale,
+                'motion_scale': result.motion_scale,
+                'over_target_n': metadata.get('over_target', ''),
+                'under_target_n': metadata.get('under_target', ''),
+                'stopped_or_opened': metadata.get('stopped_or_opened', ''),
+                'sampling_mode': metadata.get('sampling_mode', 'scale'),
+                'sampling_candidates': metadata.get('sampling_candidates', ''),
+                'sampling_best_idx': metadata.get('sampling_best_idx', ''),
+                'sampling_best_score': metadata.get('sampling_best_score', ''),
+                'sampling_best_proxy_force': metadata.get('sampling_best_proxy_force', ''),
+                'sampling_score_steps': metadata.get('sampling_score_steps', ''),
+                'sampling_action_force_gain': metadata.get('sampling_action_force_gain', ''),
+                'gripper_index': gripper_index if gripper_index is not None else '',
+                'base_gripper_cmd': base_gripper,
+                'steered_gripper_cmd': action_gripper,
+                'mask_px': mask_area,
+                'mask_frac': mask_frac,
+                'frame_mean': frame_mean,
+                'sat_mean': sat_mean,
+                'val_mean': val_mean,
+            }
+
+            write_header = not csv_path.exists()
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
 
     def flush_tts_rollout(self):
         with self.tts_rollout_lock:
@@ -464,6 +688,7 @@ class DiffusionPolicy:
             )
             print(f'TTS mask video saved: {out_dir / "mask.mp4"}')
             print(f'TTS PNG frames saved: {out_dir / "frames"}')
+            print(f'TTS force CSV saved: {out_dir / "force_log.csv"}')
             self._encode_h264_rollout(out_dir)
             self.tts_rollout = None
             self.tts_rollout_frames = 0
@@ -681,6 +906,30 @@ def main():
         help='Mask generator for --tts-auto-mask. sam2 matches the ViewForce offline chain.',
     )
     parser.add_argument(
+        '--tts-steering-mode',
+        choices=['scale', 'sample'],
+        default='scale',
+        help='scale = feedback scaling; sample = sample DP chunks and rerank by force score.',
+    )
+    parser.add_argument(
+        '--tts-sampling-candidates',
+        type=int,
+        default=8,
+        help='Number of DP action chunks to sample when --tts-steering-mode sample.',
+    )
+    parser.add_argument(
+        '--tts-sampling-score-steps',
+        type=int,
+        default=4,
+        help='Number of leading action steps used by the sampling force proxy.',
+    )
+    parser.add_argument(
+        '--tts-action-force-gain',
+        type=float,
+        default=1.0,
+        help='Proxy gain: predicted next force = current force + gain * mean closing action.',
+    )
+    parser.add_argument(
         '--tts-sam2-model',
         choices=['tiny', 'small', 'base', 'large'],
         default='small',
@@ -769,6 +1018,10 @@ def main():
         tts_auto_mask=args.tts_auto_mask,
         tts_masker=tts_masker,
         tts_mask_mode=args.tts_mask_mode,
+        tts_steering_mode=args.tts_steering_mode,
+        tts_sampling_candidates=args.tts_sampling_candidates,
+        tts_sampling_score_steps=args.tts_sampling_score_steps,
+        tts_action_force_gain=args.tts_action_force_gain,
         tts_rollout_dir=args.tts_rollout_dir if steering_pipeline is not None else None,
         tts_rollout_fps=args.tts_rollout_fps,
         tts_mask_h_min=args.tts_mask_h_min,
