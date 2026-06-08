@@ -138,3 +138,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Test-time steering rollout artifacts
+tts_rollouts/
